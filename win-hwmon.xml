@@ -1,0 +1,37 @@
+<service>
+  <id>win-hwmon</id>
+  <name>Windows Hardware → MQTT</name>
+  <description>Publishes Windows hardware metrics to MQTT with Home Assistant discovery.</description>
+
+  <!-- Path to python.exe -->
+  <executable>C:\Windows\py.exe</executable>
+  <arguments>-u "C:\Tools\win-hwmon\lhm_auto_launcher.py" --debug</arguments>
+  <workingdirectory>C:\Tools\win-hwmon</workingdirectory>
+
+  <!-- Environment (put your MQTT settings here, or set system env vars) -->
+  <env name="MQTT_HOST" value="192.168.1.6" />
+  <env name="MQTT_PORT" value="1883" />
+  <env name="MQTT_USERNAME" value="win-hwmon" />
+  <env name="MQTT_PASSWORD" value="DVox/mk3H/FSmXn5uW9ceZifuf3Ehl0i2vakU3K4d6w=" />
+  <env name="BASE_TOPIC" value="site/home/devices/winhw/%COMPUTERNAME%" />
+  <env name="DISCOVERY_PREFIX" value="site/home/homeassistant" />
+  <env name="PUBLISH_INTERVAL" value="10" />
+  <env name="TARGET_SCRIPT" value="win_hwmon_mqtt.py" />
+  <env name="PYTHONUNBUFFERED" value="1" />
+  <env name="PYTHONFAULTHANDLER" value="1" />
+  <env name="LAUNCHER_LOG" value="C:\Tools\win-hwmon\logs\launcher.log" />
+
+  <!-- Log rotation -->
+  <logpath>C:\Tools\win-hwmon\logs</logpath>
+  <log mode="roll-by-size-time">
+    <sizeThreshold>10485760</sizeThreshold> <!-- 10 MB -->
+    <pattern>yyyyMMdd</pattern>
+    <keepFiles>5</keepFiles>
+  </log>
+
+  <!-- Keep it resilient -->
+  <onfailure action="restart" delay="5 sec" />
+  <resetFailure>1 hour</resetFailure>
+  <stoptimeout>15 sec</stoptimeout>
+  <startmode>Automatic</startmode>
+</service>
