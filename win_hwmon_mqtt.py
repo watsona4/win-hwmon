@@ -590,7 +590,7 @@ def detect_physical_drives(logger) -> List[str]:
 
 
 def smartctl_path(logger) -> Optional[str]:
-    p = shutil.which("smartctl") or shutil.which("smartctl.exe")
+    p = 'C:\\Program Files\\smartmontools\\bin\\smartctl.EXE' #shutil.which("smartctl") or shutil.which("smartctl.exe")
     logger.debug(f"smartctl path: {p}")
     return p
 
@@ -689,6 +689,66 @@ def smart_parse(dev: str, data: Dict[str, Any]) -> Dict[str, Any]:
                     pass
     return out
 
+import psutil, time, subprocess, json
+
+def uptime_seconds() -> int:
+    try:
+        return int(time.time() - psutil.boot_time())
+    except Exception:
+        return 0
+
+def windows_updates_pending(logger) -> int:
+    """
+    Count pending software updates via COM using a tiny PowerShell one-liner.
+    Works without PSWindowsUpdate module.
+    """
+    cmd = [
+        "powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+        "(New-Object -ComObject Microsoft.Update.Session).CreateUpdateSearcher()." +
+        "Search(\"IsInstalled=0 and Type='Software'\").Updates.Count"
+    ]
+    try:
+        out = subprocess.check_output(cmd, timeout=15)
+        return int(out.decode(errors="ignore").strip() or "0")
+    except Exception as e:
+        logger.debug(f"windows_updates_pending failed: {e}")
+        return 0
+
+def services_status(logger, names_csv: str) -> tuple[list[str], list[str]]:
+    """
+    names_csv: comma-separated service *names* (not display names).
+    """
+    ok, bad = [], []
+    try:
+        import psutil
+        for raw in [n.strip() for n in (names_csv or "").split(",") if n.strip()]:
+            try:
+                svc = psutil.win_service_get(raw)
+                if (svc.as_dict().get("status") or "").lower() == "running":
+                    ok.append(raw)
+                else:
+                    bad.append(raw)
+            except Exception as e:
+                logger.debug(f"Service {raw} check failed: {e}")
+                bad.append(raw)
+    except Exception as e:
+        logger.debug(f"services_status failed: {e}")
+    return ok, bad
+
+def nvidia_gpu_percent(logger) -> int | None:
+    # Fallback if LHM doesn’t expose GPU load
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu",
+             "--format=csv,noheader,nounits"],
+            timeout=3
+        ).decode().strip().splitlines()
+        vals = [int(v) for v in out if v.strip().isdigit()]
+        return int(sum(vals)/len(vals)) if vals else None
+    except Exception as e:
+        logger.debug(f"nvidia_gpu_percent failed: {e}")
+        return None
 
 # ------------- App -------------
 @dataclass
@@ -718,15 +778,24 @@ class App:
 
         self.client = mqtt_client(logger)
 
-        def _on_connect(client, userdata, flags, rc, properties=None):
-            self.logger.info(f"MQTT connected rc={rc}")
+        def _on_connect(client, userdata, flags, rc, properties):
+            if rc == 0:
+                self.logger.info("MQTT connected rc=0")
+                self.pub(avail_topic(), "online", retain=True, qos=1)
+                self.publish_discovery()
+            else:
+                self.logger.warning(f"MQTT connect failed rc={rc}")
 
-        def _on_disconnect(client, userdata, rc, properties=None):
+        def _on_disconnect(client, userdata, flags, rc, properties):
             self.logger.warning(f"MQTT disconnected rc={rc}")
 
         self.client.on_connect = _on_connect
         self.client.on_disconnect = _on_disconnect
 
+        self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+        self.client.max_inflight_messages_set(20)
+        self.client.max_queued_messages_set(0)
+        
         self.last_disk: Dict[str, DiskSample] = {}
 
         self.load1 = EWMA(alpha=min(1.0, PUBLISH_INTERVAL / 60.0))
@@ -743,9 +812,34 @@ class App:
         self.logger.debug(f"LHM_URLS_ENV={LHM_URLS_ENV} LHM_HOST={LHM_HOST} LHM_PORT={LHM_PORT} LHM_PATH={LHM_PATH} LHM_TIMEOUT={LHM_TIMEOUT}")
         self.logger.debug(f"HAVE_WMI={HAVE_WMI}")
 
+    def try_reconnect(self):
+        try:
+            self.logger.info("Attempting MQTT reconnect...")
+            self.client.reconnect()
+            return True
+        except Exception as e:
+            self.logger.debug(f"Immediate reconnect failed: {e}")
+            return False
+
     def pub(self, topic: str, payload: str, retain: bool = False, qos: int = 0):
         self.logger.debug(f"MQTT PUBLISH [{qos}]{'[retain]' if retain else ''} {topic} -> {payload}")
-        self.client.publish(topic, payload, qos=qos, retain=retain)
+        res = self.client.publish(topic, payload, qos=qos, retain=retain)
+        try:
+            rc = res.rc
+        except Exception:
+            rc = getattr(res, "rc", none)
+
+        if rc is None:
+            return res
+
+        if rc != mqtt.MQTT_ERR_SUCCESS:
+            self.logger.warning(f"Publish rc={rc} (not connected?).")
+            if rc == mqtt.MQTT_ERR_NO_CONN:
+                if self.try_reconnect():
+                    self.client.publish(avail_topic(), "online", qos=1, retain=True)
+                    res = self.client.publish(topic, payload, qos=qos, retain=retain)
+                    self.logger.debug(f"Retry publish rc={res.rc}")
+        return res
 
     def publish_discovery(self):
         c = self.client
@@ -874,6 +968,35 @@ class App:
                     pub_config(c, "sensor", f"{clean}_{key}", f"SMART {dev} {label}",
                                f"{BASE_TOPIC}/smart/{clean}/{key}",
                                unit=unit, icon=icon, state_class="measurement")
+        # Uptime
+        pub_config(c, "sensor", make_obj_id("uptime_s"), "Uptime (s)",
+                f"{BASE_TOPIC}/uptime_s", icon="mdi:timer-outline", state_class="measurement")
+
+        # Updates pending
+        pub_config(c, "sensor", make_obj_id("updates_pending"), "Updates Pending",
+                f"{BASE_TOPIC}/updates/pending", icon="mdi:update", state_class="measurement")
+
+        # GPU percent (generic)
+        pub_config(c, "sensor", make_obj_id("gpu", "percent"), "GPU Utilization",
+                f"{BASE_TOPIC}/gpu/percent", unit="%", icon="mdi:gpu", state_class="measurement")
+
+        # Services rollup
+        pub_bin_sensor(c, make_obj_id("services", "ok"), "Services OK",
+                    f"{BASE_TOPIC}/services/ok")
+        pub_config(c, "sensor", make_obj_id("services", "checked"), "Services Checked",
+                f"{BASE_TOPIC}/services/checked", icon="mdi:playlist-check", state_class="measurement")
+        pub_config(c, "sensor", make_obj_id("services", "bad_list"), "Services (Bad CSV)",
+                f"{BASE_TOPIC}/services/bad_list", icon="mdi:alert")
+
+        # Per-service binary_sensors (for Auto-entities “services glob”)
+        services = env_list("WATCH_SERVICES")
+        for svc in services:
+            svc_clean = make_obj_id(svc)
+            obj_id = make_obj_id(DEVICE_ID, svc_clean, "service")  # -> <hostname>_<service>_service
+            st = f"{BASE_TOPIC}/services/{svc_clean}/running"
+            # entity_category=diagnostic + payload_on/off already provided by pub_bin_sensor()
+            pub_bin_sensor(c, obj_id, f"Service {svc}", st, icon="mdi:cog")
+
 
     def publish_once(self):
         cpu_pct = psutil.cpu_percent(interval=None)
@@ -1006,16 +1129,16 @@ class App:
                     dc, icon = None, 'mdi:swap-vertical'
                 elif s['type'] in ('Data','SmallData','Energy','Factor'):
                     dc, icon = None, 'mdi:database'
-                pub_config(c, 'sensor', s['obj_id'], s['name'], f"{BASE_TOPIC}/lhm/{s['obj_id']}",
+                pub_config(self.client, 'sensor', s['obj_id'], s['name'], f"{BASE_TOPIC}/lhm/{s['obj_id']}",
                            unit=s['unit'], device_class=dc, icon=icon, state_class='measurement')
         except Exception as e:
             self.logger.debug(f"LHM discovery failed: {e}")
 
         try:
-            pub_config(c, 'sensor', make_obj_id('net', 'active_name'), 'Network Active Name', f"{BASE_TOPIC}/network/active/name")
-            pub_config(c, 'sensor', make_obj_id('net', 'active_up_bps'), 'Network Active Up', f"{BASE_TOPIC}/network/active/up_bps", unit='B/s', icon='mdi:upload')
-            pub_config(c, 'sensor', make_obj_id('net', 'active_down_bps'), 'Network Active Down', f"{BASE_TOPIC}/network/active/down_bps", unit='B/s', icon='mdi:download')
-            pub_config(c, 'sensor', make_obj_id('net', 'active_ipv4'), 'Network Active IPv4', f"{BASE_TOPIC}/network/active/ipv4")
+            pub_config(self.client, 'sensor', make_obj_id('net', 'active_name'), 'Network Active Name', f"{BASE_TOPIC}/network/active/name")
+            pub_config(self.client, 'sensor', make_obj_id('net', 'active_up_bps'), 'Network Active Up', f"{BASE_TOPIC}/network/active/up_bps", unit='B/s', icon='mdi:upload')
+            pub_config(self.client, 'sensor', make_obj_id('net', 'active_down_bps'), 'Network Active Down', f"{BASE_TOPIC}/network/active/down_bps", unit='B/s', icon='mdi:download')
+            pub_config(self.client, 'sensor', make_obj_id('net', 'active_ipv4'), 'Network Active IPv4', f"{BASE_TOPIC}/network/active/ipv4")
         except Exception as e:
             self.logger.debug(f"Active NIC discovery failed: {e}")
 
@@ -1067,6 +1190,50 @@ class App:
         except Exception:
             pass
 
+        # Uptime
+        self.pub(f"{BASE_TOPIC}/uptime_s", str(uptime_seconds()))
+
+        # Updates
+        upd = windows_updates_pending(self.logger)
+        self.pub(f"{BASE_TOPIC}/updates/pending", str(upd))
+        if upd > 0:
+            issues.append(f"Updates {upd}")
+
+        # GPU percent
+        gpu_pct = None
+        try:
+            # Try to infer from LHM “Load / GPU” if present; else fall back to nvidia-smi
+            # You’re already mirroring LHM sensors into BASE_TOPIC/lhm/* above.
+            # If you kept the list of LHM sensors this tick, you could scan it; otherwise:
+            gpu_pct = nvidia_gpu_percent(self.logger)
+        except Exception:
+            pass
+        if gpu_pct is not None:
+            self.pub(f"{BASE_TOPIC}/gpu/percent", str(int(gpu_pct)))
+            if gpu_pct >= 95:
+                issues.append(f"GPU {gpu_pct}%")
+            else:
+                notes.append(f"GPU {gpu_pct}%")
+
+        # Services (optional; controlled by WATCH_SERVICES env)
+        watch = os.getenv("WATCH_SERVICES", "")
+        ok, bad = services_status(self.logger, watch)
+        self.pub(f"{BASE_TOPIC}/services/checked", str(len(ok) + len(bad)))
+        self.pub(f"{BASE_TOPIC}/services/ok", "1" if not bad else "0")
+        self.pub(f"{BASE_TOPIC}/services/bad_list", ",".join(bad))
+        if bad:
+            issues.append("Svc " + ",".join(bad))
+
+        # Per-service state topics (1 running / 0 not running)
+        services = env_list("WATCH_SERVICES")
+        ok_set = set(ok)
+        for svc in services:
+            svc_clean = make_obj_id(svc)
+            st = f"{BASE_TOPIC}/services/{svc_clean}/running"
+            self.pub(st, "1" if svc in ok_set else "0")
+
+        # existing overall_ok/summary block already handles ‘issues’/’notes’
+
         overall_ok = "0" if issues else "1"
         summary = "OK"
         if issues:
@@ -1090,7 +1257,11 @@ class App:
                 self.publish_once()
             else:
                 while True:
-                    self.publish_once()
+                    if not self.client.is_connected():
+                        self.logger.debug("MQTT not connected; skipping this publish cycle.")
+                        self.try_reconnect()
+                    else:
+                        self.publish_once()
                     time.sleep(PUBLISH_INTERVAL)
         except KeyboardInterrupt:
             self.logger.info("Exiting (KeyboardInterrupt)")
